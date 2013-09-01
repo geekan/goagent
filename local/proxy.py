@@ -1820,28 +1820,26 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def do_METHOD_GAE(self):
         """GAE http urlfetch"""
-        host = self.headers.get('Host', '')
+        request_headers = dict((k.title(), v) for k, v in self.headers.items())
+        host = request_headers.get('Host', '')
         path = self.parsed_url.path
         range_in_query = 'range=' in self.parsed_url.query
         special_range = (any(x(host) for x in common.AUTORANGE_HOSTS_MATCH) or path.endswith(common.AUTORANGE_ENDSWITH)) and not path.endswith(common.AUTORANGE_NOENDSWITH)
-        if 'Range' in self.headers:
-            m = re.search('bytes=(\d+)-', self.headers['Range'])
+        if 'Range' in request_headers:
+            m = re.search('bytes=(\d+)-', request_headers['Range'])
             start = int(m.group(1) if m else 0)
-            self.headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
-            logging.info('autorange range=%r match url=%r', self.headers['Range'], self.path)
+            request_headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
+            logging.info('autorange range=%r match url=%r', request_headers['Range'], self.path)
         elif not range_in_query and special_range:
-            try:
-                logging.info('Found [autorange]endswith match url=%r', self.path)
-                m = re.search('bytes=(\d+)-', self.headers.get('Range', ''))
-                start = int(m.group(1) if m else 0)
-                self.headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
-            except StopIteration:
-                pass
+            logging.info('Found [autorange]endswith match url=%r', self.path)
+            m = re.search('bytes=(\d+)-', request_headers.get('Range', ''))
+            start = int(m.group(1) if m else 0)
+            request_headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
 
         payload = b''
-        if 'Content-Length' in self.headers:
+        if 'Content-Length' in request_headers:
             try:
-                payload = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                payload = self.rfile.read(int(request_headers.get('Content-Length', 0)))
             except NetWorkIOError as e:
                 logging.error('handle_method_urlfetch read payload failed:%s', e)
                 return
@@ -1859,7 +1857,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     kwargs['password'] = common.GAE_PASSWORD
                 if common.GAE_VALIDATE:
                     kwargs['validate'] = 1
-                response = self.urlfetch(self.command, self.path, self.headers, payload, fetchserver, **kwargs)
+                response = self.urlfetch(self.command, self.path, request_headers, payload, fetchserver, **kwargs)
                 if not response and retry == common.FETCHMAX_LOCAL-1:
                     html = message_html('502 URLFetch failed', 'Local URLFetch %r failed' % self.path, str(errors))
                     self.wfile.write(b'HTTP/1.0 502\r\nContent-Type: text/html\r\n\r\n' + html.encode('utf-8'))
@@ -1973,7 +1971,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 http_util.dns.pop(host, None)
             realhost = next(common.HOSTS_CONNECT_MATCH[x] for x in common.HOSTS_CONNECT_MATCH if x(self.path))
             if realhost:
-                http_util.dns[host] = socket.gethostbyname_ex(realhost)[-1]
+                http_util.dns[host] = list(set(sum([socket.gethostbyname_ex(x)[-1] for x in realhost.split('|')], [])))
             self.do_CONNECT_FWD()
         elif host.endswith(common.GOOGLE_SITES) and not host.endswith(common.GOOGLE_WITHGAE):
             http_util.dns[host] = common.GOOGLE_HOSTS
@@ -2241,12 +2239,8 @@ class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 mimetype = 'application/octet-stream'
             if self.path.endswith('.pac?flush'):
                 thread.start_new_thread(PacUtil.update_pacfile, args=(self.pacfile,))
-            elif time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED or os.path.getsize(self.pacfile) < 4 * 1024:
-                os.utime(filename, (time.time(), time.time()))
-                if time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED or os.path.getsize(self.pacfile) < 4 * 1024:
-                    thread.start_new_thread(PacUtil.update_pacfile, args=(self.pacfile,))
-                else:
-                    logging.info('%r is updating by other thread, ignore', filename)
+            elif time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED:
+                thread.start_new_thread(lambda: os.utime(self.pacfile, (time.time(), time.time())) or PacUtil.update_pacfile(self.pacfile))
             self.send_file(filename, mimetype)
         else:
             self.wfile.write(b'HTTP/1.1 404\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n404 Not Found')
@@ -2262,7 +2256,7 @@ class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.wfile.write(data)
 
 
-class DNSServer(gevent.server.DatagramServer if gevent else object):
+class DNSServer(gevent.server.DatagramServer if gevent and hasattr(gevent.server, 'DatagramServer') else object):
     """DNS TCP Proxy based on gevent/dnslib"""
 
     blacklist = set(['1.1.1.1',
@@ -2392,7 +2386,7 @@ def pre_start():
     if common.PAC_ENABLE:
         pac_ip = ProxyUtil.get_listen_ip() if common.PAC_IP in ('', '::', '0.0.0.0') else common.PAC_IP
         url = 'http://%s:%d/%s' % (pac_ip, common.PAC_PORT, common.PAC_FILE)
-        spawn_later(5, lambda x: urllib2.build_opener(urllib2.ProxyHandler({})).open(x), url)
+        spawn_later(600, lambda x: urllib2.build_opener(urllib2.ProxyHandler({})).open(x), url)
     if common.DNS_ENABLE:
         if dnslib is None or gevent.version_info[0] < 1:
             logging.critical('GoAgent DNSServer requires dnslib and gevent 1.0')
